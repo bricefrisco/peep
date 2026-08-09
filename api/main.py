@@ -1,5 +1,6 @@
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -7,7 +8,12 @@ from fastapi import FastAPI
 from . import db
 from .repos import router as repos_router
 
-load_dotenv()
+# Explicit path, not load_dotenv()'s implicit caller-file-relative search:
+# that search falls back to os.getcwd() whenever __main__ has no __file__
+# (e.g. under `uvicorn --reload`, whose worker is spawned via
+# multiprocessing on Windows) -- and cwd is the project root, not this
+# component's own directory, so it would silently miss api/.env.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 @asynccontextmanager

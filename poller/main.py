@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import threading
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -22,7 +23,9 @@ HANDLERS = {
 
 
 def main():
-    load_dotenv()
+    # See api/main.py for why this is an explicit path rather than a bare
+    # load_dotenv() call.
+    load_dotenv(Path(__file__).resolve().parent / ".env")
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
