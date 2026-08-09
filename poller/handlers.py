@@ -70,15 +70,28 @@ def compute_derived_fields(merged):
             _parse_ts(created_at) - _parse_ts(account_created_at)
         ).days
 
+    # commit_count_approx / actual commit-history span, NOT repo_age_days:
+    # a repo can be created recently but pushed with years of pre-existing
+    # history (fork-with-full-history, migration, mirror) -- repo_age_days
+    # measures how long the GitHub repo object has existed, not how long
+    # the counted commits actually span, and using it produces nonsense
+    # velocity for imported-history repos (e.g. 1456 commits / <1 day old
+    # repo = "1456 commits/day" for a repo with normal, low real activity).
     commit_count_approx = merged.get("commit_count_approx")
-    repo_age_days = merged.get("repo_age_days")
-    if commit_count_approx is not None and repo_age_days is not None:
-        derived["commits_per_day"] = commit_count_approx / max(repo_age_days, 1)
+    oldest_commit_date = merged.get("oldest_commit_date")
+    newest_commit_date = merged.get("newest_commit_date")
+    if (
+        commit_count_approx is not None
+        and oldest_commit_date is not None
+        and newest_commit_date is not None
+    ):
+        span_days = (_parse_ts(newest_commit_date) - _parse_ts(oldest_commit_date)).days
+        derived["commits_per_day"] = commit_count_approx / max(span_days, 1)
 
     return derived
 
 
-def handle_repos_call(session, conn, owner, repo, repo_row):
+def handle_repos_call(session, conn, owner, repo, repo_row, rate_limiter):
     data = _get(session, f"{API_ROOT}/repos/{owner}/{repo}").json()
 
     created_at = data.get("created_at")
@@ -112,7 +125,7 @@ def handle_repos_call(session, conn, owner, repo, repo_row):
     }
 
 
-def handle_users_call(session, conn, owner, repo, repo_row):
+def handle_users_call(session, conn, owner, repo, repo_row, rate_limiter):
     data = _get(session, f"{API_ROOT}/users/{owner}").json()
     return {
         "account_created_at": data.get("created_at"),
@@ -123,7 +136,7 @@ def handle_users_call(session, conn, owner, repo, repo_row):
     }
 
 
-def handle_commits_call(session, conn, owner, repo, repo_row):
+def handle_commits_call(session, conn, owner, repo, repo_row, rate_limiter):
     try:
         resp = _get(
             session,
@@ -135,10 +148,47 @@ def handle_commits_call(session, conn, owner, repo, repo_row):
         if status in EMPTY_REPO_STATUSES:
             return {"commit_count_approx": 0}
         raise
-    return {"commit_count_approx": _approx_count(resp)}
+
+    commit_count_approx = _approx_count(resp)
+    newest_commits = resp.json()
+    newest_commit_date = newest_commits[0]["commit"]["author"]["date"] if newest_commits else None
+
+    fields = {
+        "commit_count_approx": commit_count_approx,
+        "newest_commit_date": newest_commit_date,
+    }
+
+    # The Link header's "last" page number equals the total commit count
+    # when per_page=1, so requesting that page returns the oldest commit --
+    # needed for compute_derived_fields to get real velocity instead of
+    # commit_count / repo_age_days (see there for why that's wrong for
+    # imported history). A second call, so a 6th call/repo -- accepted
+    # tradeoff, see SCHEMA.md's API call budget.
+    if commit_count_approx == 1:
+        fields["oldest_commit_date"] = newest_commit_date
+    elif commit_count_approx and commit_count_approx > 1:
+        try:
+            rate_limiter.acquire()
+            oldest_resp = _get(
+                session,
+                f"{API_ROOT}/repos/{owner}/{repo}/commits",
+                params={"per_page": 1, "page": commit_count_approx},
+            )
+            oldest_commits = oldest_resp.json()
+            if oldest_commits:
+                fields["oldest_commit_date"] = oldest_commits[0]["commit"]["author"]["date"]
+        except Exception as exc:
+            # commit_count_approx and newest_commit_date are still useful
+            # on their own -- don't fail the whole job over this call.
+            logger.warning(
+                "oldest-commit lookup for %s/%s failed, leaving oldest_commit_date null: %s",
+                owner, repo, exc,
+            )
+
+    return fields
 
 
-def handle_contributors_call(session, conn, owner, repo, repo_row):
+def handle_contributors_call(session, conn, owner, repo, repo_row, rate_limiter):
     try:
         resp = _get(
             session,
@@ -168,7 +218,7 @@ def _extension(path):
     return name.rsplit(".", 1)[-1].lower()
 
 
-def handle_tree_call(session, conn, owner, repo, repo_row):
+def handle_tree_call(session, conn, owner, repo, repo_row, rate_limiter):
     default_branch = (repo_row or {}).get("default_branch")
     if not default_branch:
         raise RuntimeError("default_branch not yet known -- waiting on the repos call")

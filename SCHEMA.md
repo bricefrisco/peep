@@ -137,7 +137,9 @@ CREATE TABLE repos (
     repo_age_days             INT,
     size_kb                    INT,
     commit_count_approx        BIGINT,     -- from commits?per_page=1 Link header
-    commits_per_day            REAL,       -- derived: commit_count_approx / repo_age_days
+    newest_commit_date         TIMESTAMPTZ,-- from commits?per_page=1 (free -- same call as the count)
+    oldest_commit_date         TIMESTAMPTZ,-- from commits?per_page=1&page=<commit_count_approx> -- a 2nd call, see "API call budget"
+    commits_per_day            REAL,       -- derived: commit_count_approx / (newest_commit_date - oldest_commit_date), NOT repo_age_days -- see compute_derived_fields
     contributor_count_approx   INT,        -- from contributors?per_page=1&anon=true Link header
     is_fork                    BOOLEAN,
     archived                   BOOLEAN,
@@ -339,10 +341,16 @@ CREATE TABLE api_call_log (
 |---|---|---|
 | 1 | `GET /repos/{owner}/{repo}` | Most of the presentation/engagement group, `is_fork`, `archived`, `has_issues_enabled`, `primary_language`, timestamps |
 | 2 | `GET /users/{owner}` | Account context group |
-| 3 | `GET /repos/{owner}/{repo}/commits?per_page=1` (`Link` header) | `commit_count_approx` |
-| 4 | `GET /repos/{owner}/{repo}/contributors?per_page=1&anon=true` (`Link` header) | `contributor_count_approx` |
-| 5 | `GET /repos/{owner}/{repo}/git/trees/{sha}?recursive=1` | File structure group |
+| 3 | `GET /repos/{owner}/{repo}/commits?per_page=1` (`Link` header) | `commit_count_approx`, `newest_commit_date` (free -- same response body) |
+| 4 | `GET /repos/{owner}/{repo}/commits?per_page=1&page=<commit_count_approx>` | `oldest_commit_date` -- skipped when there's 0-1 commits (nothing more to fetch) |
+| 5 | `GET /repos/{owner}/{repo}/contributors?per_page=1&anon=true` (`Link` header) | `contributor_count_approx` |
+| 6 | `GET /repos/{owner}/{repo}/git/trees/{sha}?recursive=1` | File structure group |
 
-5 calls/repo, funneled through a shared 1 req/sec limiter →
-~1,000–1,250 repos/hour throughput ceiling, well within the 5,000/hour
-authenticated GitHub rate limit.
+Usually 6 calls/repo (call 4 is skipped only for near-empty repos),
+funneled through a shared 1 req/sec limiter → ~830–1,040 repos/hour
+throughput ceiling, well within the 5,000/hour authenticated GitHub rate
+limit. This is a deliberate cost accepted for call 4: `commit_count_approx
+/ repo_age_days` silently produced nonsense velocity for any repo created
+with pre-existing history (fork-with-full-history, migration, mirror) --
+see `commits_per_day` above and `compute_derived_fields` in
+`poller/handlers.py`.

@@ -49,7 +49,7 @@ def worker_loop(queue_name, local_q, handler, conn, rate_limiter, session, in_fl
         try:
             rate_limiter.acquire()
             repo_row = db.get_repo(conn, repo_id)
-            fields = handler(session, conn, owner, repo, repo_row)
+            fields = handler(session, conn, owner, repo, repo_row, rate_limiter)
 
             merged = dict(repo_row or {})
             merged.update(fields)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
 from .repos import router as repos_router
@@ -24,4 +25,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Peep API", lifespan=lifespan)
+
+# labeling-ui runs on Vite's dev server (a different origin than this API),
+# so the browser needs an explicit CORS allowance to call it.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 app.include_router(repos_router)
