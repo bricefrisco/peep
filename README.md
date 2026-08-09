@@ -94,10 +94,10 @@ rate limit of 5,000 requests/hour rather than the unauthenticated 60/hour.
 pip install -r requirements.txt
 # create the raw_events table — DDL lives in SCHEMA.md
 
-cp .env.example .env
-# fill in GITHUB_TOKEN and DATABASE_URL in .env
+cp poller/.env.example poller/.env
+# fill in GITHUB_TOKEN and DATABASE_URL in poller/.env
 
-python -m peep.main
+python -m poller.main
 ```
 
 This currently runs just the `/events` poller, which batch-writes newly

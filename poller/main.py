@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from . import db, handlers, queue_manager
 from .github_client import build_session
-from .poller import poll_events_loop
+from .event_poller import poll_events_loop
 from .ratelimiter import RateLimiter
 
 logger = logging.getLogger(__name__)

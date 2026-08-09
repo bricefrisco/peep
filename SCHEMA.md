@@ -194,7 +194,7 @@ pipeline gave up. What happens on permanent failure (job exhausts
   that call's feature columns `NULL`. The repo stays eligible for
   labeling/training with one feature group missing, rather than being
   excluded over (for example) a repo too large for the tree endpoint to
-  enumerate. See `peep/queue_manager.py`'s `MARK_DONE_ON_DEAD_LETTER`.
+  enumerate. See `poller/queue_manager.py`'s `MARK_DONE_ON_DEAD_LETTER`.
 
 ### "Ready for labeling / inference" view
 
