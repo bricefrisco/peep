@@ -114,6 +114,10 @@ CREATE TABLE repos (
     manual_label_by              TEXT,               -- labeler identity
     manual_labeled_at             TIMESTAMPTZ,
 
+    -- Labeling claims (concurrency control, not ground truth -- see below)
+    claimed_by                  TEXT,
+    claimed_at                   TIMESTAMPTZ,
+
     -- Model predictions (inference output — NOT ground truth)
     model_prediction              TEXT,
     model_confidence              REAL,               -- predict_proba() output, 0.0-1.0
@@ -172,6 +176,22 @@ CREATE TABLE repos (
 
 CREATE INDEX idx_repos_owner ON repos(owner_login);
 CREATE INDEX idx_repos_manual_label ON repos(manual_label);
+
+-- Serves the "ready for labeling/inference" view (below) directly: a
+-- partial index scoped to exactly that WHERE clause, pre-sorted by
+-- fetched_at. Used by a future inference endpoint, which needs
+-- already-labeled repos too.
+CREATE INDEX idx_repos_ready_fetched_at ON repos (fetched_at DESC)
+WHERE repos_call_done AND users_call_done AND commits_call_done
+  AND contributors_call_done AND tree_call_done;
+
+-- Serves the labeling-queue view specifically (adds manual_label IS NULL
+-- on top of the above) -- used by GET /repos/next. Shrinks automatically
+-- as repos get labeled, since labeled rows no longer satisfy the predicate.
+CREATE INDEX idx_repos_labeling_queue ON repos (fetched_at DESC)
+WHERE repos_call_done AND users_call_done AND commits_call_done
+  AND contributors_call_done AND tree_call_done
+  AND manual_label IS NULL;
 ```
 
 ### `*_call_done` semantics: "finished," not "succeeded"
@@ -209,12 +229,16 @@ WHERE repos_call_done AND users_call_done AND commits_call_done
 ```
 
 with an additional `AND manual_label IS NULL` filter for the labeling
-queue specifically.
+queue specifically -- this is exactly the query `GET /repos/next` runs
+(one claimed row at a time, not a paginated list -- see "Labeling claims"
+below), served by `idx_repos_labeling_queue`.
 
 ### Label priority
 
 The order repos are presented in the labeling app. Before a model exists,
-repos are presented in FIFO order. Once a model exists, order by:
+repos are presented in FIFO order (`ORDER BY fetched_at ASC` -- oldest
+ready-to-label repo first, mirroring how `job_queue` FIFOs on insertion
+order). Once a model exists, order by:
 
 ```sql
 ORDER BY ABS(model_confidence - 0.5) ASC
@@ -223,6 +247,49 @@ ORDER BY ABS(model_confidence - 0.5) ASC
 i.e., repos the model is least certain about are surfaced first — this is
 the active-learning loop: manual labeling effort is spent where it moves
 the model the most, not on cases already obvious to it.
+
+### Labeling claims (concurrency control)
+
+Ingestion (~1,000 repos/hour) permanently outpaces manual labeling
+capacity, so the goal isn't consensus/agreement-checking between multiple
+labelers on the same repo -- there's no shortage of never-reviewed repos,
+so redundant review is wasted effort. The goal is simpler: **make sure
+concurrent labelers are never handed the same repo.**
+
+`job_queue` doesn't need `SELECT ... FOR UPDATE SKIP LOCKED` because it
+has exactly one puller (see ARCHITECTURE.md's "Job lifecycle"). That
+assumption doesn't hold here -- there can be multiple concurrent *human*
+labelers, each independently asking "what should I look at next," which
+is exactly the scenario `FOR UPDATE SKIP LOCKED` exists for.
+
+`GET /repos/next` (`api/repos.py`) implements this in one short
+transaction:
+
+1. `SELECT repo_id ... ORDER BY <priority> LIMIT 1 FOR UPDATE SKIP LOCKED`
+   over the labeling-queue view, additionally excluding repos with a live
+   claim (`claimed_by IS NULL OR claimed_at < now() - interval '10
+   minutes'`). `SKIP LOCKED` guarantees two concurrent callers can never
+   land on the same row.
+2. Still inside that transaction, write `claimed_by`/`claimed_at` for the
+   selected repo and commit.
+
+The claim is a lightweight reservation, not a lock held open across the
+labeler's browsing time (a DB transaction can't reasonably stay open while
+a human reads a repo page). It expires after 10 minutes so a repo a
+labeler claimed and then abandoned (closed the tab without submitting)
+falls back into the pool instead of being stuck forever.
+
+`POST /repos/{repo_id}/label` writes `manual_label`/`manual_label_by`/
+`manual_labeled_at` and clears the claim, scoped to `WHERE manual_label IS
+NULL` so a repo can never end up labeled twice -- defense in depth on top
+of the claim mechanism, which is what actually prevents the concurrent
+collision in the first place.
+
+No new index was needed for this: `idx_repos_labeling_queue` already
+covers `GET /repos/next` via a backward index scan (Postgres can walk a
+`fetched_at DESC` btree in reverse to satisfy `ORDER BY fetched_at ASC`
+just as cheaply as a forward scan), with the claim-expiry check applied as
+a cheap `Filter` over the already-narrow result -- confirmed via `EXPLAIN`.
 
 ### Columns deliberately excluded (and why)
 

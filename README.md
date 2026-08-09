@@ -104,6 +104,25 @@ This currently runs just the `/events` poller, which batch-writes newly
 seen events into `raw_events` (see [`ARCHITECTURE.md`](./ARCHITECTURE.md)
 for what's built vs. planned).
 
+## Running the API
+
+```
+cp api/.env.example api/.env
+# fill in DATABASE_URL in api/.env
+
+python -m uvicorn api.main:app --reload
+```
+
+Interactive docs at `/docs`. Current endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /repos/next?labeler=<id>` | Atomically claim exactly one repo for `<id>` to label next (FIFO, or by model confidence once a model exists) |
+| `POST /repos/{repo_id}/label` | Submit `{"label": "legitimate"|"suspicious", "labeled_by": "<id>"}`, releasing the claim |
+
+See `SCHEMA.md`'s "Labeling claims" section for why `GET /repos/next`
+needs `FOR UPDATE SKIP LOCKED` even though `job_queue` doesn't.
+
 ## Project status
 
 Early build — pipeline architecture and schema finalized, initial
