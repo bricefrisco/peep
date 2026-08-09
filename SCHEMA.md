@@ -28,8 +28,10 @@ namespace required at this scale.
 ```sql
 CREATE TABLE job_queue (
     id             BIGSERIAL PRIMARY KEY,
-    queue_name      TEXT NOT NULL,             -- 'raw_events' | 'repos' | 'users' | 'commits' | 'contributors' | 'tree'
-    payload         JSONB NOT NULL,
+    queue_name      TEXT NOT NULL,             -- 'repos' | 'users' | 'commits' | 'contributors' | 'tree'
+    owner_login      TEXT NOT NULL,
+    repo_name         TEXT NOT NULL,
+    repo_id           BIGINT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'pending',   -- 'pending' | 'done' | 'dead_letter'
     attempts         INT NOT NULL DEFAULT 0,
     max_attempts      INT NOT NULL DEFAULT 5,
@@ -41,9 +43,9 @@ CREATE TABLE job_queue (
 
 CREATE INDEX idx_job_queue_poll ON job_queue (queue_name, status, available_at);
 
--- Prevents duplicate enrichment jobs if raw_events processing is retried
-ALTER TABLE job_queue
-    ADD CONSTRAINT uq_job_queue_dedup UNIQUE (queue_name, (payload->>'repo_id'));
+-- Prevents duplicate enrichment jobs if fan-out is retried
+CREATE UNIQUE INDEX uq_job_queue_dedup
+ON job_queue (queue_name, repo_id);
 ```
 
 **Notes:**
@@ -51,14 +53,16 @@ ALTER TABLE job_queue
 - Only three logical states are used: `pending`, `done`, `dead_letter`.
   There is no `processing` state — see `ARCHITECTURE.md` for why this is
   safe in a single-puller, idempotent-handler design.
-- `payload` holds whatever the consuming handler needs — e.g.
-  `{"owner": "hobakpi", "repo": "Pi-Monitor", "repo_id": 1046024155}`.
+- `owner_login`, `repo_name`, and `repo_id` are the only inputs every
+  enrichment handler needs, and are the same three fields regardless of
+  `queue_name` — so they're plain columns rather than a `payload` blob
+  (unlike `raw_events.payload`, which genuinely varies by `event_type`).
 - `available_at` is used both for initial scheduling and for exponential
   backoff on retry (`available_at = now() + interval '1 second' *
   power(2, attempts)`).
-- The unique constraint on `(queue_name, payload->>'repo_id')` makes
-  re-inserting the same enrichment job a no-op (`ON CONFLICT DO NOTHING`)
-  if the `raw_events` handler is ever reprocessed after a crash.
+- The unique constraint on `(queue_name, repo_id)` makes re-inserting the
+  same enrichment job a no-op (`ON CONFLICT DO NOTHING`) if fan-out is
+  ever retried after a crash.
 
 ---
 
@@ -101,6 +105,7 @@ CREATE TABLE repos (
     -- ── Metadata (NOT fed to the model) ─────────────────────────────
     created_at                 TIMESTAMPTZ,
     pushed_at                  TIMESTAMPTZ,
+    default_branch              TEXT,               -- from the repos call; the tree call depends on this
     account_created_at         TIMESTAMPTZ,
     fetched_at                  TIMESTAMPTZ,
 
@@ -114,9 +119,6 @@ CREATE TABLE repos (
     model_confidence              REAL,               -- predict_proba() output, 0.0-1.0
     model_version                  TEXT,               -- e.g. 'gbt_2026-08-08'
     model_predicted_at              TIMESTAMPTZ,
-
-    -- Labeling queue prioritization
-    label_priority                 REAL,               -- derived; see "Label priority" below
 
     -- ── Feature columns (fed to the model) ──────────────────────────
 
@@ -172,39 +174,55 @@ CREATE INDEX idx_repos_owner ON repos(owner_login);
 CREATE INDEX idx_repos_manual_label ON repos(manual_label);
 ```
 
+### `*_call_done` semantics: "finished," not "succeeded"
+
+A `*_call_done` flag means that queue's job reached a terminal state for
+that repo -- either the call succeeded, or it permanently failed and the
+pipeline gave up. What happens on permanent failure (job exhausts
+`max_attempts` and is moved to `dead_letter`) differs by queue:
+
+- **`repos`, `users`, `commits`** -- these confirm the repo/account still
+  exists (`repos`, `users`) or are cheap enough to insist on (`commits`).
+  A dead-lettered job here leaves `*_call_done = FALSE` permanently -- the
+  repo never becomes eligible for labeling/training. Most often this is a
+  404 because the repo or owner account was deleted/banned/made private
+  between being seen in the event stream and enrichment running -- there's
+  no repo left to verify against, so it's correctly excluded rather than
+  trained on with missing identity data.
+- **`contributors`, `tree`** -- enrichment on top of an already-confirmed
+  repo. A dead-lettered job here still sets `*_call_done = TRUE`, leaving
+  that call's feature columns `NULL`. The repo stays eligible for
+  labeling/training with one feature group missing, rather than being
+  excluded over (for example) a repo too large for the tree endpoint to
+  enumerate. See `peep/queue_manager.py`'s `MARK_DONE_ON_DEAD_LETTER`.
+
 ### "Ready for labeling / inference" view
 
-A repo is fully enriched once all five `*_call_done` flags are true. This
-view is the intended read surface for both the labeling app and the model
+A repo is fully enriched once all five `*_call_done` flags are true (which,
+per above, includes repos that gave up on `contributors` or `tree`). This
+is the intended read surface for both the labeling app and the model
 training/inference pipeline:
 
 ```sql
-CREATE VIEW repos_ready AS
-SELECT * FROM repos
 WHERE repos_call_done AND users_call_done AND commits_call_done
-  AND contributors_call_done AND tree_call_done;
-
-CREATE VIEW repos_ready_for_labeling AS
-SELECT * FROM repos_ready
-WHERE manual_label IS NULL;
+  AND contributors_call_done AND tree_call_done
 ```
+
+with an additional `AND manual_label IS NULL` filter for the labeling
+queue specifically.
 
 ### Label priority
 
-`label_priority` drives the order repos are presented in the labeling
-app. Before a model exists, this should be populated from the Tier-1
-heuristic score (see below). Once a model exists, prefer:
+The order repos are presented in the labeling app. Before a model exists,
+repos are presented in FIFO order. Once a model exists, order by:
 
 ```sql
-label_priority = 1 - ABS(model_confidence - 0.5)
+ORDER BY ABS(model_confidence - 0.5) ASC
 ```
 
 i.e., repos the model is least certain about are surfaced first — this is
 the active-learning loop: manual labeling effort is spent where it moves
-the model the most, not on cases already obvious to it. Both signals
-(heuristic score and model confidence) are worth retaining even after a
-model exists; disagreement between the two is itself a useful signal for
-review.
+the model the most, not on cases already obvious to it.
 
 ### Columns deliberately excluded (and why)
 

@@ -4,18 +4,28 @@
 
 Peep runs as a **single Python process** containing multiple
 threads. PostgreSQL serves two roles simultaneously: the system of record
-(all ingested/enriched data) and the job queue (no external broker, no
-Docker, no Redis).
+(all ingested/enriched data) and the job queue for enrichment work (no
+external broker, no Docker, no Redis).
 
 ```
-GitHub /events  ──▶  poller thread  ──▶  job_queue (Postgres, queue_name='raw_events')
-                                                │
-                                                ▼
-                                    raw_events worker thread
-                                    - writes to raw_events table
-                                    - upserts placeholder row into repos
-                                    - fans out 5 jobs, one per enrichment queue
-                                                │
+GitHub /events  ──▶  poller thread
+                       - batch INSERT into raw_events (ON CONFLICT DO NOTHING)
+                                │
+                                ▼
+                       raw_events table (append-only)
+```
+
+The poller writes directly to `raw_events` — no queue in between. The
+insert is already idempotent (unique `event_id` primary key), and there's
+only ever one poller, so nothing is gained by routing it through
+`job_queue` first.
+
+**Implemented:** the poller above. **Not yet built** (see the
+[roadmap](./README.md#roadmap)): fanning newly-seen repos out into five
+enrichment jobs, and the workers that consume them:
+
+```
+                                │
                     ┌───────────────┬───────────┼───────────┬───────────────┐
                     ▼               ▼           ▼           ▼               ▼
                'repos' queue   'users' queue 'commits'  'contributors'  'tree' queue
@@ -31,7 +41,7 @@ GitHub /events  ──▶  poller thread  ──▶  job_queue (Postgres, queue_
                                    *_call_done flags mark completion per column group
 ```
 
-All GitHub API calls — from every worker, regardless of queue — pass
+All GitHub API calls — from whichever thread is making them — pass
 through one shared, in-process rate limiter capped at 1 request/second.
 
 ## Why Postgres-as-queue instead of Redis/RQ/Celery
@@ -102,8 +112,8 @@ properties of this design:
 2. **Idempotent handlers.** Every enrichment handler is an upsert
    (`UPDATE repos SET ... WHERE repo_id = ...`) — reprocessing the same
    job twice produces the same end state as processing it once. The
-   `raw_events` fan-out is made idempotent via a unique constraint plus
-   `ON CONFLICT DO NOTHING` on `job_queue` inserts, keyed on
+   enrichment fan-out itself is made idempotent via a unique constraint
+   plus `ON CONFLICT DO NOTHING` on `job_queue` inserts, keyed on
    `(queue_name, repo_id)`.
 
 Given both properties, a crash between "pulled into memory" and "marked
@@ -201,8 +211,8 @@ exclusively.
 | Failure point | Recovery |
 |---|---|
 | Crash after job pulled into memory, before handled | Row still `pending` in Postgres; re-pulled on restart |
-| Crash mid-fan-out (some of 5 enrichment jobs inserted, not all) | Re-processing the source event is safe due to `ON CONFLICT DO NOTHING` dedup on `(queue_name, repo_id)` |
-| Handler throws an exception | Job rescheduled with exponential backoff, up to `max_attempts`, then moved to `dead_letter` |
+| Crash mid-fan-out (some of 5 enrichment jobs inserted, not all) | Re-inserting the remaining jobs is safe — `ON CONFLICT DO NOTHING` dedup on `(queue_name, repo_id)` makes fan-out idempotent |
+| Handler throws an exception | Job rescheduled with exponential backoff, up to `max_attempts`, then moved to `dead_letter`. For `contributors`/`tree`, the repo's `*_call_done` is still set so it stays eligible for training with that feature group left `NULL`; for `repos`/`users`/`commits`, `*_call_done` stays `FALSE` and the repo is permanently excluded -- see `SCHEMA.md` |
 | In-flight duplication within a single run | Prevented by in-memory `in_flight_ids` set |
 
 ## Threading model
@@ -210,9 +220,8 @@ exclusively.
 ```python
 def main():
     threads = [
-        threading.Thread(target=poll_events_loop, daemon=True),
-        threading.Thread(target=puller_loop, daemon=True),
-        threading.Thread(target=worker_loop, args=("raw_events", handle_raw_event), daemon=True),
+        threading.Thread(target=poll_events_loop, daemon=True),   # polls /events, batch-writes raw_events
+        threading.Thread(target=puller_loop, daemon=True),        # not yet built
         threading.Thread(target=worker_loop, args=("repos", handle_repos_call), daemon=True),
         threading.Thread(target=worker_loop, args=("users", handle_users_call), daemon=True),
         threading.Thread(target=worker_loop, args=("commits", handle_commits_call), daemon=True),

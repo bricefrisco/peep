@@ -86,7 +86,23 @@ rate limit of 5,000 requests/hour rather than the unauthenticated 60/hour.
 - Python 3.11+
 - PostgreSQL 14+ (for `FOR UPDATE SKIP LOCKED` support and `JSONB`)
 - A GitHub personal access token with public-repo read access
-- `psycopg2`, `requests` (see `requirements.txt`)
+- `psycopg2`, `requests`, `python-dotenv` (see `requirements.txt`)
+
+## Running the poller
+
+```
+pip install -r requirements.txt
+# create the raw_events table — DDL lives in SCHEMA.md
+
+cp .env.example .env
+# fill in GITHUB_TOKEN and DATABASE_URL in .env
+
+python -m peep.main
+```
+
+This currently runs just the `/events` poller, which batch-writes newly
+seen events into `raw_events` (see [`ARCHITECTURE.md`](./ARCHITECTURE.md)
+for what's built vs. planned).
 
 ## Project status
 
@@ -98,7 +114,6 @@ work begins once an initial labeled dataset exists.
 
 - [ ] Ingestion pipeline (poller + 6 worker threads)
 - [ ] Labeling web app (Flask/FastAPI + minimal frontend)
-- [ ] Tier-1 heuristic scorer (rule-based, pre-model triage)
 - [ ] First trained classifier (logistic regression / GBT) on manually
       labeled data
 - [ ] Model confidence feeding back into labeling queue prioritization
